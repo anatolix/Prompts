@@ -36,13 +36,24 @@ source openrc.sh
 export OS_REGION_NAME=eu-north1
 openstack keypair create --public-key ~/.ssh/id_ed25519.pub <имя>
 openstack server create \
-  --flavor 84651434-65f0-4e4f-867c-181a80d9dc43 \   # hostvds-16
-  --image 33baaf7f-11fe-49e4-b866-4f82c7c1f35b \    # Ubuntu-24.04
-  --network <Internet-NN-id> \                       # любая Internet-*, НЕ RESERVE-*/NOTWORKING-*
+  --flavor 45f32f0b-a79d-4c93-977c-57d2a8753d5e \   # hostvds-16 (актуально на сен 2026)
+  --image 60fb7be9-02f1-48ee-ac23-fe36db7d69e2 \    # Ubuntu-24.04 (актуально на сен 2026)
+  --network 008299cd-25ff-4cf2-aa9a-d6d8d605484a \  # Internet-06; НЕ RESERVE-*/NOTWORKING-*
   --key-name <имя> \
   --user-data cloud-init.yaml \
+  --config-drive true \                             # ОБЯЗАТЕЛЬНО, см. грабли 2
   <vm-name>
 ```
+
+⚠ **ID flavor/image протухают.** Перед созданием проверить актуальные:
+`openstack flavor list` (искать hostvds-16) и `openstack image list` (искать Ubuntu-24.04).
+
+### ⚠ Грабли 2: без --config-drive user-data не приклеивается
+
+Без `--config-drive true` VM поднимается с `DataSourceNone` — cloud-init НЕ ВЫПОЛНЯЕТСЯ:
+нет пользователя vellum, нет ключей, нет ufw. В `openstack server show` поле `user_data`
+пустое. Лечения нет — VM пересоздавать с `--config-drive true`. IP при пересоздании
+МЕНЯЕТСЯ — DNS делегировать только после финального создания.
 
 **cloud-init.yaml:** пользователь `vellum` (твой публичный ключ, `sudo: ALL=(ALL) NOPASSWD:ALL`,
 `lock_passwd: true`), root выключен, `ssh_pwauth: false`, package_upgrade, ufw 22/80/443,
@@ -58,12 +69,33 @@ openstack security group rule create --proto tcp --dst-port 22  default
 openstack security group rule create --proto tcp --dst-port 80  default
 openstack security group rule create --proto tcp --dst-port 443 default
 openstack security group rule create --proto icmp default
+openstack security group rule create --proto ipv6-icmp --ethertype IPv6 default
 ```
+
+Правила идемпотентны — при повторе дают Conflict 409, это норма. Проверка:
+`openstack security group rule list default --long`.
 
 Диагностика: `openstack console log show <vm>` — если cloud-init завершился, а снаружи
 таймаут, это security group, а не VM.
 
-**Проверка:** `ssh vellum@<ip>` проходит.
+### ⚠ Грабли 3: MTU — SSH виснет на KEX
+
+Сеть HostVDS между VM (и до части интернета) имеет реальный MTU ~1430 при eth0 mtu 1500,
+а ICMP fragmentation-needed где-то глушится — PMTUD blackhole. Симптом: SSH вешается на
+`expecting SSH2_MSG_KEX_ECDH_REPLY` — дефолтный KEX sntrup761 шлёт пакет ~1.2KB, который
+дропается. Обход на раз: `ssh -o KexAlgorithms=curve25519-sha256` (32-байтные ключи
+проходят). Постоянное лечение — MTU 1400 в netplan **на обеих VM сразу**:
+
+```sh
+sudo sed -i 's/mtu: 1500/mtu: 1400/' /etc/netplan/50-cloud-init.yaml
+sudo netplan apply
+ip link show eth0   # mtu 1400
+```
+
+После этого дефолтный KEX работает. Диагностика PMTUD: `ping -M do -s 1440 <ip>` —
+если молчит при рабочем обычном пинге, это оно.
+
+**Проверка шага 1:** `ssh vellum@<ip>` проходит.
 
 ---
 
@@ -92,13 +124,24 @@ TimeoutStartSec=300
 Environment=PATH=%h/.bun/bin:/usr/local/sbin:/usr/sbin:/usr/local/bin:/usr/bin:/bin
 ```
 
-### ⚠ Грабли 2: PATH юнита обязан содержать /usr/sbin
+### ⚠ Грабли 4: PATH юнита обязан содержать /usr/sbin
 
 Без него vellum не находит системный nginx, сообщает «nginx is not installed»
 (вводит в заблуждение — nginx установлен) и публичный edge не поднимается.
 
 ```sh
 systemctl --user enable --now vellum-<имя>.service
+```
+
+### ⚠ Грабли 5: `assistant` CLI без VELLUM_WORKSPACE_DIR идёт не туда
+
+CLI резолвит workspace только через переменную окружения `VELLUM_WORKSPACE_DIR`.
+Без неё смотрит в `~/.vellum/workspace` и падает с
+«Could not connect to the assistant at /home/vellum/.vellum/workspace/assistant.sock»
+— даже если сидеть в каталоге workspace. В каждом шелле/скрипте:
+
+```sh
+export VELLUM_WORKSPACE_DIR=$HOME/.local/share/vellum/assistants/<имя>/.vellum/workspace
 ```
 
 **Проверка:** reboot → ассистент возвращается сам (~1 мин), `assistant status` зелёный.
@@ -108,13 +151,20 @@ systemctl --user enable --now vellum-<имя>.service
 ## Шаг 3. Домен и публичный HTTPS
 
 1. DNS: A-запись `<host>.<домен>` → IP VM. Дождаться резолва.
-2. `assistant config set ingress.publicBaseUrl https://<host>.<домен>`
-   — vellum поднимет свой nginx edge на 127.0.0.1:7840.
+2. ```sh
+   assistant config set ingress.publicBaseUrl https://<host>.<домен>
+   assistant config set ingress.enabled true
+   systemctl --user restart vellum-<имя>.service
+   ```
+   ⚠ **Грабли 6:** edge на 127.0.0.1:7840 НЕ стартует только от publicBaseUrl —
+   обязателен `ingress.enabled true` + рестарт демона. Без этого порт 7840 молчит,
+   а журнал не пишет ничего внятного.
 3. Системный nginx: 80→443 редирект; 443→127.0.0.1:7840 с websocket Upgrade map
    и `client_max_body_size 200m`.
-4. `certbot --nginx -d <host>.<домен>` — сертификат Let's Encrypt.
+4. `certbot --nginx -d <host>.<домен> --redirect` — сертификат Let's Encrypt.
 
-**Проверка:** https://<host>.<домен> отдаёт веб-клиент.
+**Проверка:** `ss -tln | grep 7840` слушает; https://<host>.<домен> редиректит на
+`/assistant/`, и `https://<host>.<домен>/assistant/` отдаёт 200.
 
 ---
 
@@ -261,12 +311,17 @@ callback registration available: yes. `assistant platform credits` показы�
 
 | # | Симптом | Причина | Лечение |
 |---|---|---|---|
-| 1 | VM ACTIVE, SSH таймаут | OpenStack default SG пускает только своих | Явные правила 22/80/443/icmp (шаг 1) |
-| 2 | «nginx is not installed» | Нет /usr/sbin в PATH юнита | Environment=PATH с /usr/sbin (шаг 2) |
-| 3 | Фоновые LLM-задачи висят | defaultProvider=vellum | config set → openrouter (шаг 4) |
-| 4 | Окно логина платформы не всплывает | Сигнал никем не потребляется | CLI-логин + ручной callback (шаг 6.2) |
-| 5 | Логин-процесс умирает | bash убивает дерево процессов | systemd-run --user (шаг 6.2) |
-| 6 | «Some credentials could not be injected» | Баг инъекции в CLI | Ручной reprovision + POST /v1/secrets (шаг 6.3) |
-| 7 | `vellum pair`: command not found | Нет bun в PATH | env PATH=... vellum pair (шаг 5) |
-| 8 | Telegram настроен, но молчит | Нет webhook_secret / reconcile не запущен | Креды + config set ingress.publicBaseUrl (шаг 5) |
-| 9 | ensure-registration даёт другой assistant id | Платформа перевыдала запись | Использовать id из ensure-registration (шаг 6.3) |
+| 1 | VM ACTIVE, SSH таймаут | OpenStack default SG пускает только своих | Явные правила 22/80/443/icmp/ipv6-icmp (шаг 1) |
+| 2 | Нет пользователя vellum, cloud-init не отработал | Нет --config-drive true | VM пересоздать с --config-drive (шаг 1) |
+| 3 | SSH виснет на KEX_ECDH_REPLY | PMTUD blackhole, реальный MTU ~1430 | MTU 1400 в netplan; обход: KexAlgorithms=curve25519-sha256 (шаг 1) |
+| 4 | «nginx is not installed» | Нет /usr/sbin в PATH юнита | Environment=PATH с /usr/sbin (шаг 2) |
+| 5 | assistant CLI: «Could not connect... .vellum/workspace» | Нет VELLUM_WORKSPACE_DIR | export VELLUM_WORKSPACE_DIR=... (шаг 2) |
+| 6 | Порт 7840 молчит после config set | Нет ingress.enabled true | config set ingress.enabled true + рестарт (шаг 3) |
+| 7 | Фоновые LLM-задачи висят | defaultProvider=vellum | config set → openrouter (шаг 4) |
+| 8 | Окно логина платформы не всплывает | Сигнал никем не потребляется | CLI-логин + ручной callback (шаг 6.2) |
+| 9 | Логин-процесс умирает | bash убивает дерево процессов | systemd-run --user (шаг 6.2) |
+| 10 | «Some credentials could not be injected» | Баг инъекции в CLI | Ручной reprovision + POST /v1/secrets (шаг 6.3) |
+| 11 | `vellum pair`: command not found | Нет bun в PATH | env PATH=... vellum pair (шаг 5) |
+| 12 | Telegram настроен, но молчит | Нет webhook_secret / reconcile не запущен | Креды + config set ingress.publicBaseUrl (шаг 5) |
+| 13 | ensure-registration даёт другой assistant id | Платформа перевыдала запись | Использовать id из ensure-registration (шаг 6.3) |
+| 14 | flavor/image ID не находится | ID протухли | openstack flavor/image list (шаг 1) |
